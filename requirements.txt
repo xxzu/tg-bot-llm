@@ -1,0 +1,28 @@
+# Gemini Telegram Bot 依赖
+
+# Telegram Bot
+aiogram>=3.0.0
+
+# 环境变量
+python-dotenv
+
+# 时区处理
+pytz
+
+# 数据库
+aiosqlite
+peewee
+
+# 模型配置
+PyYAML>=6.0
+
+# AI APIs
+google-generativeai
+openai
+
+# 图像处理
+Pillow
+
+# 音频处理
+pydub
+edge-tts

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "miaomiao-telegram-mod": {
+      "command": "/root/tg_bot/gemini_tg_bot/.venv/bin/python",
+      "args": ["/root/tg_bot/gemini_tg_bot/mcp_server/server.py"],
+      "cwd": "/root/tg_bot/gemini_tg_bot",
+      "env": {
+        "TG_BOT_TOKEN": "从 .env 复制，勿提交仓库"
+      }
+    }
+  }
+}

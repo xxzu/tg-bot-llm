@@ -1,0 +1,55 @@
+# 环境与密钥（只提交 env.example / mcp.json.example）
+.env
+.env.*
+!.env.example
+env.local
+*.pem
+*.key
+secrets/
+credentials.json
+
+# MCP 本地配置（含 TG_BOT_TOKEN）
+mcp_server/mcp.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+
+# 运行时数据与数据库
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# 日志与临时文件
+*.log
+logs/
+tmp/
+temp/
+.cache/
+
+# 编辑器与系统
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# 测试与覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# 语音缓存（若存在）
+voice/cache/
