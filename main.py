@@ -3,7 +3,9 @@ Gemini Telegram Bot 主入口文件
 """
 import asyncio
 import logging
+import os
 import sys
+from pathlib import Path
 
 from aiogram import Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -49,6 +51,23 @@ async def main():
         await bot.session.close()
 
 
+def _setup_logging() -> None:
+    _level = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, _level, logging.INFO)
+    fmt = logging.Formatter("%(levelname)s:%(name)s:%(message)s")
+    root = logging.getLogger()
+    root.setLevel(level)
+    root.handlers.clear()
+    stream_h = logging.StreamHandler(sys.stdout)
+    stream_h.setFormatter(fmt)
+    root.addHandler(stream_h)
+    log_dir = Path(__file__).resolve().parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    file_h = logging.FileHandler(log_dir / "bot.log", encoding="utf-8")
+    file_h.setFormatter(fmt)
+    root.addHandler(file_h)
+
+
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.ERROR, stream=sys.stdout)
+    _setup_logging()
     asyncio.run(main())

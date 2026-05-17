@@ -1,42 +1,42 @@
 """
-消息处理器模块
-处理文本、图片、语音消息
+消息处理器：薄适配层，业务编排在 services.application。
 """
 import asyncio
-import logging
 import re
 
 from aiogram import Router, F, types
-from aiogram.enums import MessageEntityType, ParseMode
+from aiogram.enums import MessageEntityType
 from aiogram.filters.state import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 from config.settings import OWNER_ID, bot
 from config.text import pick_thinking_status
-from models.database import get_or_create_user_data, save_user_data
-from services.gemini import download_and_encode_image, process_image_with_gemini
-from services.llm import get_invoker
-from services.llm.types import LLMChatRequest, LLMVisionRequest
-from utils.bot_cache import get_bot_info
-from utils.stream_reply import stream_to_telegram_message_or_fallback
-from utils.telegram_text import ensure_telegram_text, prepare_telegram_body
-from services.voice import process_voice_message, text_to_speech
-from utils.markdown import clean_text_for_tts
-from utils.reply_context import merge_prompt_with_reply_context
-from handlers.callbacks import ChangeValueState
-
-# 导入群组管理模块
+from handlers.states import ChangeValueState
+from models.database import (
+    get_or_create_user_data,
+    model_storage_ids,
+    save_user_data,
+)
+from services.application.dto import IncomingChatContext, ReplyDeliveryMode
+from services.application.message_use_cases import (
+    HandlePhotoMessageUseCase,
+    HandleTextMessageUseCase,
+)
+from services.application.response_presenter import ResponsePresenter
 from services.group_admin import group_admin
-from services.group_context import build_group_system_addon
-from services.moderation_tools import ModerationToolContext, should_use_group_tools
-from services.moderation_actions import apply_moderation_actions, parse_and_strip_mod_tags
+from services.group_admin.image_moderation import moderate_group_photo
+from services.voice import process_voice_message, text_to_speech
+from utils.bot_cache import get_bot_info
+from utils.markdown import clean_text_for_tts
 
 router = Router()
 
+_text_use_case = HandleTextMessageUseCase()
+_photo_use_case = HandlePhotoMessageUseCase()
+
 
 def _message_mentions_bot(message: Message, bot_id: int, bot_username: str) -> bool:
-    """检测 @用户名 或 选人提及（text_mention）是否指向本机器人。"""
     if message.text and message.entities:
         for ent in message.entities:
             if ent.type == MessageEntityType.MENTION and bot_username:
@@ -51,7 +51,6 @@ def _message_mentions_bot(message: Message, bot_id: int, bot_username: str) -> b
 
 
 def _strip_bot_mention_from_text(message: Message, bot_id: int, bot_username: str) -> str:
-    """从正文中去掉指向本机器人的 @ 或选人提及片段，得到用户实际问题。"""
     if not message.text:
         return ""
     text = message.text
@@ -75,37 +74,69 @@ def _strip_bot_mention_from_text(message: Message, bot_id: int, bot_username: st
     return text.strip()
 
 
+_WAKE_WORDS = ("喵", "喵喵", "晚安")
+
+
+def _message_has_wake_word(text: str) -> bool:
+    if not text:
+        return False
+    return any(w in text for w in _WAKE_WORDS)
+
+
+def _build_incoming(message: Message, bot_id: int, bot_username: str) -> IncomingChatContext:
+    message_text = (message.text or "").strip()
+    reply = message.reply_to_message
+    reply_to_bot = bool(reply and reply.from_user and reply.from_user.id == bot_id)
+    mentioned = _message_mentions_bot(message, bot_id, bot_username)
+    if mentioned:
+        message_text = _strip_bot_mention_from_text(message, bot_id, bot_username)
+    return IncomingChatContext(
+        user_id=message.from_user.id,
+        chat_id=message.chat.id,
+        chat_type=message.chat.type,
+        message_text=message_text,
+        has_voice=bool(message.voice),
+        is_reply_to_bot=reply_to_bot,
+        is_mention=mentioned,
+        has_wake_word=_message_has_wake_word(message.text or ""),
+    )
+
+
+async def _ensure_group_gate(bot, message: Message) -> bool:
+    """群聊违规预审；已处理返回 True。"""
+    if message.chat.type not in ("group", "supergroup"):
+        return False
+    if not group_admin.async_init_done:
+        await group_admin.init_db()
+    if group_admin.is_ignored(message.chat.id, message.from_user.id):
+        return True
+    return await group_admin.check_and_handle_message(bot, message)
+
+
 @router.message(StateFilter(ChangeValueState.waiting_for_new_value))
 async def process_new_value(message: types.Message, state: FSMContext):
-    """处理新系统角色值输入"""
     user_id = message.from_user.id
     chat_id = message.chat.id
-
     if user_id not in OWNER_ID:
         await message.answer("抱歉，您没有访问此机器人的权限。")
         return
-
     sys_massage = ""
-
     if message.voice:
         sys_massage = await process_voice_message(bot, message, user_id)
     elif message.text:
         sys_massage = message.text
-
-    user_data = await get_or_create_user_data(user_id, chat_id)
-    user_data.system_message = sys_massage
-    await save_user_data(user_id, chat_id)
-
-    await state.clear()
-
-    await message.answer(
-        f"<b>系统角色已更改为：</b> <i>{user_data.system_message}</i>"
+    storage_uid, storage_cid = model_storage_ids(
+        user_id, chat_id, message.chat.type
     )
+    settings = await get_or_create_user_data(storage_uid, storage_cid)
+    settings.system_message = sys_massage
+    await save_user_data(storage_uid, storage_cid)
+    await state.clear()
+    await message.answer(f"<b>系统角色已更改为：</b> <i>{settings.system_message}</i>")
 
 
 @router.message(F.content_type.in_({"text", "voice"}))
 async def chatgpt_text_handler(message: Message):
-    """处理文本和语音消息"""
     user_id = message.from_user.id
     chat_id = message.chat.id
     chat_type = message.chat.type
@@ -113,348 +144,133 @@ async def chatgpt_text_handler(message: Message):
     bot_id = bot_me.id
     bot_username = bot_me.username or ""
 
-    # 在群组中先检查违规内容
-    if chat_type in ["group", "supergroup"]:
-        if not group_admin.async_init_done:
-            await group_admin.init_db()
-        
-        # 检查用户是否被忽略
-        if group_admin.is_ignored(chat_id, user_id):
-            return  # 静默忽略该用户的消息
-        
-        if await group_admin.check_and_handle_message(bot, message):
-            return
-
-    # 处理群组消息的唤醒词 / @ / 回复机器人
-    message_text = (message.text or "").strip()
-    should_process = True
-
-    if chat_type in ["group", "supergroup"]:
-        should_process = False
-        reply = message.reply_to_message
-        reply_to_bot = bool(
-            reply and reply.from_user and reply.from_user.id == bot_id
-        )
-        mentioned = _message_mentions_bot(message, bot_id, bot_username)
-        wake = ("喵" in message_text) or ("晚安" in message_text)
-
-        if reply_to_bot:
-            should_process = True
-        elif mentioned:
-            message_text = _strip_bot_mention_from_text(message, bot_id, bot_username)
-            if message_text or message.voice:
-                should_process = True
-        elif wake:
-            should_process = True
-
-    if not should_process:
+    if await _ensure_group_gate(bot, message):
         return
-    
-    # 权限检查
+
+    incoming = _build_incoming(message, bot_id, bot_username)
+    if chat_type in ("group", "supergroup") and not (
+        incoming.is_reply_to_bot
+        or (incoming.is_mention and (incoming.message_text or incoming.has_voice))
+        or incoming.has_wake_word
+    ):
+        return
+
     if chat_type == "private" and user_id not in OWNER_ID:
         await message.answer("抱歉，您没有访问此机器人的权限。")
         return
 
-    if chat_type in ["group", "supergroup"]:
+    group_data = None
+    if chat_type in ("group", "supergroup"):
         user_data, group_data = await asyncio.gather(
             get_or_create_user_data(user_id, chat_id),
             get_or_create_user_data(chat_id, chat_id),
         )
-        current_model = group_data.model
-        current_model_info = group_data.model_message_info
-        current_system_message = group_data.system_message
     else:
         user_data = await get_or_create_user_data(user_id, chat_id)
-        current_model = user_data.model
-        current_model_info = user_data.model_message_info
-        current_system_message = user_data.system_message
 
-    await message.bot.send_chat_action(chat_id, action="typing")
+    presenter = ResponsePresenter(message, bot)
+    await presenter.send_typing()
 
-    promt = ""
-
-    if message.voice:
-        promt = await process_voice_message(bot, message, user_id)
-    elif message.text:
-        promt = message_text
-    else:
-        promt = ""
-
-    # 引用回复：喵喵 / @ / 回复机器人 触发时，把被引用消息正文并入上下文
-    promt = merge_prompt_with_reply_context(promt, message.reply_to_message)
-
-    invoker = get_invoker()
-    model_spec = invoker.resolve(current_model)
-    if not model_spec:
-        await message.reply(
-            f"当前模型未在配置中注册（{current_model}）。请在菜单中重新选择模型。"
-        )
-        return
-
-    use_group_tools = should_use_group_tools(chat_type, model_spec)
-    llm_request = LLMChatRequest(
-        model_id=current_model,
+    status_holder: dict = {}
+    result = await _text_use_case.execute(
+        bot=bot,
+        message=message,
+        incoming=incoming,
         user_data=user_data,
-        prompt=promt,
-        system_instruction="",
+        group_data=group_data,
+        status_message_holder=status_holder,
     )
 
-    user_data.messages.append({"role": "user", "content": promt})
-    reply_already_sent = False
-    response_message = ""
-    status_message = None
+    if not result.handled:
+        return
+    if result.early_reply:
+        await presenter.reply_plain(result.early_reply)
+        return
+    if result.error_message:
+        await presenter.delete_status(status_holder.get("msg"))
+        await presenter.reply_plain(f"发生错误：{result.error_message}")
+        return
 
+    status_message = status_holder.get("msg")
     try:
-        system_instruction = current_system_message if current_system_message else (
-            "你叫喵喵，群聊风格：直接、机灵、略毒舌，能吐槽，但别刻薄过头。"
-            "只答当前问题，不延伸；先说结论，再补一句；"
-            "全文尽量1到3句。默认简体中文，不复述，不反问，不说废话，不要客服腔。"
-            "评价类必须明确站队；不确定就直说，别瞎编。"
+        if result.mod_note_reply:
+            await presenter.send_mod_note(result.mod_note_reply)
+        if result.prefer_voice_out and result.response_text.strip():
+            await presenter.send_record_voice()
+            voice_sent = await text_to_speech(
+                bot,
+                chat_id,
+                clean_text_for_tts(result.response_text),
+                user_data.voice_type,
+            )
+            if voice_sent:
+                await presenter.delete_status(status_message)
+                return
+        await presenter.deliver_text(
+            result.response_text,
+            status_message=status_message,
+            delivery_mode=result.delivery_mode,
         )
-        llm_request.system_instruction = system_instruction
-
-        if chat_type in ["group", "supergroup"]:
-            group_addon = await build_group_system_addon(
-                bot, message, use_tools=use_group_tools
-            )
-            if group_addon:
-                llm_request.system_instruction = f"{system_instruction}\n\n{group_addon}"
-
-        if not invoker.is_available(current_model):
-            await message.reply(invoker.unavailable_reason(current_model))
-            return
-
-        # 仅「用户发语音 + 开启语音回复」时走 TTS，且不用流式（避免先出字再录音）
-        prefer_voice_out = bool(message.voice) and user_data.voice_answer
-
-        if use_group_tools:
-            status_message = await message.reply(pick_thinking_status())
-            tool_ctx = await ModerationToolContext.from_message(message)
-            response_message = await invoker.chat_with_tools(llm_request, tool_ctx)
-        elif model_spec.supports("stream") and not prefer_voice_out:
-            stream = invoker.iter_chat(llm_request)
-            response_message = await stream_to_telegram_message_or_fallback(
-                message, stream
-            )
-            reply_already_sent = True
-        else:
-            status_message = await message.reply(pick_thinking_status())
-            response_message = await invoker.chat(llm_request)
-
-        if not use_group_tools:
-            response_message, mod_actions = parse_and_strip_mod_tags(
-                response_message or ""
-            )
-            if chat_type in ["group", "supergroup"] and mod_actions:
-                requester_is_admin = await group_admin.is_admin(
-                    bot, chat_id, user_id
-                )
-                mod_notes = await apply_moderation_actions(
-                    bot,
-                    message,
-                    mod_actions,
-                    requester_is_admin=requester_is_admin,
-                )
-                if mod_notes:
-                    note = "；".join(mod_notes)
-                    if reply_already_sent:
-                        await message.reply(f"🛡️ {note}")
-                    if response_message:
-                        response_message = f"{response_message}\n（{note}）"
-                    else:
-                        response_message = note
-
-        response_message = ensure_telegram_text(response_message or "")
-
-        user_data.messages.append({"role": "assistant", "content": response_message})
-        user_data.count_messages += 1
-
-        asyncio.create_task(save_user_data(user_id, chat_id))
-
-        async def deliver_text_reply(response_text: str) -> None:
-            """优先把占位「解毛线球」消息编辑成正式回复。"""
-            response_text = ensure_telegram_text(response_text)
-            if status_message and len(response_text) <= 4096:
-                body, parse_mode = prepare_telegram_body(response_text)
-                try:
-                    if parse_mode == "HTML":
-                        await status_message.edit_text(
-                            body,
-                            parse_mode=ParseMode.HTML,
-                            disable_web_page_preview=True,
-                        )
-                    else:
-                        await status_message.edit_text(
-                            body,
-                            disable_web_page_preview=True,
-                        )
-                    return
-                except Exception:
-                    try:
-                        await status_message.delete()
-                    except Exception:
-                        pass
-            elif status_message:
-                try:
-                    await status_message.delete()
-                except Exception:
-                    pass
-            if len(response_text) > 4096:
-                await send_message_kwargs_long(response_text)
-            else:
-                await send_message_kwargs(response_text)
-
-        async def send_message_kwargs(response_message_kwargs):
-            body, parse_mode = prepare_telegram_body(response_message_kwargs)
-            if parse_mode == "HTML":
-                await message.reply(
-                    body,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
-            else:
-                await message.reply(body, disable_web_page_preview=True)
-
-        async def send_message_kwargs_long(response_message_kwargs):
-            content = ensure_telegram_text(response_message_kwargs)
-            messages_split = content.split("\n")
-            chunk = ""
-            chunks = []
-
-            for line in messages_split:
-                if len(chunk) + len(line) + 1 > 4096:
-                    chunks.append(chunk)
-                    chunk = line
-                else:
-                    if chunk:
-                        chunk += line + "\n"
-                    else:
-                        chunk = line
-
-            if chunk:
-                chunks.append(chunk)
-
-            for i, chunk in enumerate(chunks):
-                body, parse_mode = prepare_telegram_body(chunk)
-                if i == 0:
-                    if parse_mode == "HTML":
-                        await message.reply(
-                            body,
-                            parse_mode=ParseMode.HTML,
-                            disable_web_page_preview=True,
-                        )
-                    else:
-                        await message.reply(body, disable_web_page_preview=True)
-                else:
-                    if parse_mode == "HTML":
-                        await message.answer(
-                            body,
-                            parse_mode=ParseMode.HTML,
-                            disable_web_page_preview=True,
-                        )
-                    else:
-                        await message.answer(body, disable_web_page_preview=True)
-
-        try:
-            if prefer_voice_out and response_message.strip():
-                await message.bot.send_chat_action(chat_id, action="record_voice")
-                tts_text = clean_text_for_tts(response_message)
-                voice_sent = await text_to_speech(
-                    bot, message.chat.id, tts_text, user_data.voice_type
-                )
-                if voice_sent:
-                    if status_message:
-                        try:
-                            await status_message.delete()
-                        except Exception:
-                            pass
-                    return
-                logging.warning("语音发送失败，降级为文字回复")
-
-            if not reply_already_sent:
-                await deliver_text_reply(response_message)
-
-        except Exception as e:
-            logging.exception(e)
-            if not reply_already_sent:
-                await deliver_text_reply(response_message)
-
     except Exception as e:
+        import logging
+
         logging.exception(e)
-        if status_message:
-            try:
-                await status_message.delete()
-            except Exception:
-                pass
-        await message.reply(f"发生错误：{e}")
+        if result.delivery_mode != ReplyDeliveryMode.STREAM_ALREADY_SENT:
+            await presenter.deliver_text(
+                result.response_text,
+                status_message=status_message,
+                delivery_mode=ReplyDeliveryMode.PLACEHOLDER_THEN_EDIT,
+            )
 
 
 @router.message(F.photo)
 async def chatgpt_photo_vision_handler(message: Message, state: FSMContext):
-    """处理图片消息"""
     user_id = message.from_user.id
     chat_id = message.chat.id
     chat_type = message.chat.type
 
-    # 在群组中先检查违规内容
-    if chat_type in ["group", "supergroup"]:
+    if chat_type in ("group", "supergroup"):
         if not group_admin.async_init_done:
             await group_admin.init_db()
-        
-        # 检查用户是否被忽略
         if group_admin.is_ignored(chat_id, user_id):
-            return  # 静默忽略该用户的消息
-        
-        should_check = await group_admin.should_check_image(bot, chat_id, user_id)
-        
-        if should_check:
-            if await group_admin.check_and_handle_message(bot, message):
-                await group_admin.record_image_sent(chat_id, user_id)
-                return
-            await group_admin.record_image_sent(chat_id, user_id)
-        else:
             return
+        should_check = await group_admin.should_check_image(bot, chat_id, user_id)
+        if not should_check:
+            return
+        if await group_admin.check_and_handle_message(bot, message):
+            await group_admin.record_image_sent(chat_id, user_id)
+            return
+        mod_outcome = await moderate_group_photo(bot, message)
+        await group_admin.record_image_sent(chat_id, user_id)
+        if mod_outcome.brief_notice:
+            await message.answer(mod_outcome.brief_notice)
+        elif mod_outcome.error:
+            import logging
+
+            logging.warning("群聊图片审核: %s", mod_outcome.error)
+        return
 
     if chat_type == "private" and user_id not in OWNER_ID:
         await message.answer("抱歉，您没有访问此机器人的权限。")
         return
-
     if state is not None:
         await state.clear()
 
+    presenter = ResponsePresenter(message, bot)
+    temp_message = await message.answer(pick_thinking_status())
     try:
         user_data = await get_or_create_user_data(user_id, chat_id)
-        temp_message = await message.answer(pick_thinking_status())
-
-        text = message.caption or "图片上有什么？"
-        photo = message.photo[-1]
-        file_info = await message.bot.get_file(photo.file_id)
-        file_url = f"https://api.telegram.org/file/bot{bot.token}/{file_info.file_path}"
-
-        base64_image = await download_and_encode_image(file_url)
-        
-        invoker = get_invoker()
-        spec = invoker.resolve(user_data.model)
-        vision_request = LLMVisionRequest(
-            model_id=user_data.model,
-            prompt=text,
-            image_base64=base64_image,
+        result = await _photo_use_case.execute(
+            bot=bot, message=message, user_data=user_data
         )
-        if spec and spec.supports("vision") and invoker.is_available(user_data.model):
-            ai_response = await invoker.vision(vision_request)
-        else:
-            ai_response = await process_image_with_gemini(text, base64_image)
-
-        user_data.count_messages += 1
-        await save_user_data(user_id, chat_id)
-        
-        await message.bot.delete_message(chat_id, temp_message.message_id)
-        body, parse_mode = prepare_telegram_body(ai_response)
-        if parse_mode == "HTML":
-            await message.answer(body, parse_mode=ParseMode.HTML)
-        else:
-            await message.answer(body)
-
+        if result.early_reply:
+            await presenter.reply_plain(result.early_reply)
+            return
+        await presenter.send_photo_answer(
+            result.response_text, temp_message=temp_message
+        )
     except Exception as e:
+        import logging
+
         logging.exception(e)
-        await message.reply(f"发生错误：{e}")
+        await presenter.reply_plain(f"发生错误：{e}")

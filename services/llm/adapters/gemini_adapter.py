@@ -12,8 +12,8 @@ from utils.telegram_text import ensure_telegram_text
 logger = logging.getLogger(__name__)
 
 
-def _build_gemini_contents(system_instruction: str, user_data, prompt: str) -> str:
-    history_slice = slice_messages_for_api(user_data.messages)
+def _build_gemini_contents(system_instruction: str, conversation, prompt: str) -> str:
+    history_slice = slice_messages_for_api(conversation.messages)
     if not history_slice:
         return f"{system_instruction}\n\n用户: {prompt}"
     history_text = ""
@@ -28,7 +28,7 @@ async def complete(request: LLMChatRequest) -> str:
     from services.gemini import USE_NEW_API, client, genai_old
 
     contents = _build_gemini_contents(
-        request.system_instruction, request.user_data, request.prompt
+        request.system_instruction, request.conversation, request.prompt
     )
     model_id = request.model_id
 

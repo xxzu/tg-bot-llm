@@ -61,7 +61,7 @@ async def apply_moderation_actions(
         return []
 
     quoted_body = (reply.text or reply.caption or "").strip()
-    quoted_is_ad = group_admin.check_keywords(chat_id, quoted_body) is not None
+    quoted_is_ad = await mod.check_text_violation(chat_id, quoted_body) is not None
 
     results: List[str] = []
     operator_id = message.from_user.id if message.from_user else 0

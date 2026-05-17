@@ -8,10 +8,11 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 import aiohttp
 
 from services.http_session import get_http_session
-from services.llm.messages import build_chat_messages
+from services.llm.messages import build_chat_messages_from_request
 from services.llm.registry import LLMRegistry, ModelSpec, ProviderSpec
 from services.llm.types import LLMChatRequest, LLMVisionRequest
-from services.moderation_tools import OPENAI_MODERATION_TOOLS, ModerationToolContext, execute_tool
+from services.moderation_tools import OPENAI_MODERATION_TOOLS, execute_tool
+from services.ports.moderation_context import ModerationToolContext
 from utils.telegram_text import ensure_telegram_text
 
 logger = logging.getLogger(__name__)
@@ -88,9 +89,7 @@ async def complete(
     spec: ModelSpec,
     request: LLMChatRequest,
 ) -> str:
-    messages = build_chat_messages(
-        request.system_instruction, request.user_data, request.prompt
-    )
+    messages = build_chat_messages_from_request(request)
     payload = _build_payload(registry, spec, messages, stream=False)
     result = await _post_json(provider.base_url, _auth_headers(provider), payload)
     if "choices" in result and result["choices"]:
@@ -104,9 +103,7 @@ async def iter_complete(
     spec: ModelSpec,
     request: LLMChatRequest,
 ) -> AsyncIterator[str]:
-    messages = build_chat_messages(
-        request.system_instruction, request.user_data, request.prompt
-    )
+    messages = build_chat_messages_from_request(request)
     headers = _auth_headers(provider)
     headers["Accept"] = "text/event-stream"
     payload = _build_payload(registry, spec, messages, stream=True)
@@ -130,9 +127,7 @@ async def complete_with_tools(
     *,
     max_tool_rounds: int = 3,
 ) -> str:
-    messages = build_chat_messages(
-        request.system_instruction, request.user_data, request.prompt
-    )
+    messages = build_chat_messages_from_request(request)
     headers = _auth_headers(provider)
     extra = dict(registry.inference_payload(spec))
     extra["stream"] = False

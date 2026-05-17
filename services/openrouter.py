@@ -198,7 +198,5 @@ async def generate_text_with_openrouter_stream(
     return full_response
 
 
-# OpenRouter 模型列表
-OPENROUTER_MODELS = [
-    ("arcee-ai/trinity-large-preview:free", "Trinity (Free)"),
-]
+# 免费模型列表请用 services/openrouter_catalog.py + ./manage.sh sync-openrouter 同步
+OPENROUTER_MODELS: list[tuple[str, str]] = []

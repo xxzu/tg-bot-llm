@@ -42,10 +42,13 @@ class UserData:
         self.chat_id = chat_id if chat_id is not None else user_id
         self.messages = []
         self._count_messages = 0
-        self._model = "arcee-ai/trinity-large-preview:free"  # 默认使用 OpenRouter Trinity
-        self._model_message_info = "OpenRouter Trinity (Free)"
+        from services.llm.registry import default_model_for_session
+
+        model_id, model_info, max_out = default_model_for_session()
+        self._model = model_id
+        self._model_message_info = model_info
         self._model_message_chat = ""
-        self._max_out = 16384
+        self._max_out = max_out
         self._voice_answer = False
         self._voice_type = "cat"  # 默认音色
         self._system_message = ""

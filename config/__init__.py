@@ -4,4 +4,4 @@ from config.settings import (
     timezone, bot, formatted_datetime
 )
 from config.buttons import keyboard, keyboard_pic, BUTTONS_ALL
-from config.text import start_message, help_message, system_message_text
+from config.text import build_start_message, help_message, system_message_text

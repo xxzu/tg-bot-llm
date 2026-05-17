@@ -53,6 +53,24 @@ async def init_db() -> None:
         await conn.commit()
 
 
+def model_storage_ids(user_id: int, chat_id: int, chat_type: str) -> tuple[int, int]:
+    """
+    与对话/菜单共用的模型、系统角色等配置的存储键。
+    群聊：整群一份 (chat_id, chat_id)；私聊：(user_id, chat_id)。
+    """
+    if chat_type in ("group", "supergroup"):
+        return int(chat_id), int(chat_id)
+    return int(user_id), int(chat_id)
+
+
+async def get_chat_settings_data(
+    user_id: int, chat_id: int, chat_type: str
+) -> UserData:
+    """获取当前会话的模型与系统角色等设置（与 /menu 切换模型同一存储）。"""
+    sid, scid = model_storage_ids(user_id, chat_id, chat_type)
+    return await get_or_create_user_data(sid, scid)
+
+
 async def get_or_create_user_data(user_id: int, chat_id: int = None) -> UserData:
     """获取或创建用户数据（区分私聊和群组，带缓存）"""
     if chat_id is None:

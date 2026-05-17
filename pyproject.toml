@@ -1,0 +1,28 @@
+[project]
+name = "gemini-tg-bot"
+version = "0.1.0"
+description = "Gemini Telegram Bot（喵喵）"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiogram>=3.0.0",
+    "aiohttp>=3.9.0",
+    "aiosqlite>=0.20.0",
+    "edge-tts>=6.1.0",
+    "google-generativeai>=0.8.0",
+    "google-genai>=1.0.0",
+    "openai>=2.0.0",
+    "peewee>=3.17.0",
+    "pillow>=10.0.0",
+    "pydub>=0.25.0",
+    "python-dotenv>=1.0.0",
+    "pytz>=2024.1",
+    "pyyaml>=6.0",
+    "jieba>=0.42.0",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.2.0"]
+
+[tool.uv]
+package = false

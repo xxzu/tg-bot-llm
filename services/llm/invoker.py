@@ -8,7 +8,7 @@ from typing import AsyncIterator, Optional
 from services.llm.adapters import gemini_adapter, openai_compat
 from services.llm.registry import LLMRegistry, ModelSpec, get_registry
 from services.llm.types import LLMChatRequest, LLMVisionRequest
-from services.moderation_tools import ModerationToolContext
+from services.ports.moderation_context import ModerationToolContext
 
 
 class LLMInvoker:

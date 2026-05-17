@@ -78,7 +78,7 @@ async def miaomiao_group_context(
 
 @mcp.tool()
 async def miaomiao_check_message(chat_id: int, text: str) -> str:
-    """检查文本是否命中群内屏蔽词（广告/诈骗/色情/垃圾），返回 violation_type 或 null。"""
+    """贝叶斯检查文本是否为广告，返回 violation_type（spam）或 null。"""
     v = await mod.check_text_violation(chat_id, text)
     return _json({"violation_type": v, "is_violation": v is not None})
 
@@ -125,12 +125,12 @@ async def miaomiao_moderate_spam(
     reason: str = "广告/垃圾信息",
 ) -> str:
     """
-    当 message_text 命中屏蔽词时执行处置（可不校验 operator 为群管）。
+    当 message_text 被贝叶斯判为广告时执行处置（可不校验 operator 为群管）。
     典型：先 miaomiao_check_message，再对本工具传入同一正文。
     """
     v = await mod.check_text_violation(chat_id, message_text)
     if v is None:
-        return _json({"ok": False, "message": "文本未命中屏蔽词，拒绝自动执法"})
+        return _json({"ok": False, "message": "文本未被判定为广告，拒绝自动执法"})
     result = await mod.execute_moderation(
         chat_id,
         action,
@@ -145,20 +145,6 @@ async def miaomiao_moderate_spam(
     )
     result["violation_type"] = v
     return _json(result)
-
-
-@mcp.tool()
-async def miaomiao_keyword_add(chat_id: int, keyword: str) -> str:
-    """为群添加自定义屏蔽词。"""
-    ok = await mod.add_keyword(chat_id, keyword)
-    return _json({"ok": ok, "keyword": keyword})
-
-
-@mcp.tool()
-async def miaomiao_keyword_list(chat_id: int) -> str:
-    """列出群自定义屏蔽词（不含全局内置词）。"""
-    kws = await mod.list_keywords(chat_id)
-    return _json({"keywords": kws})
 
 
 @mcp.tool()

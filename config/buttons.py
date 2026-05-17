@@ -77,7 +77,7 @@ keyboard_nvidia = InlineKeyboardMarkup(
     inline_keyboard=[[button] for button in inline_buttons_nvidia]
 )
 
-def _openrouter_buttons():
+def get_openrouter_buttons() -> list[tuple[str, str]]:
     from services.llm.registry import get_registry
 
     return [
@@ -86,12 +86,13 @@ def _openrouter_buttons():
     ] + [("返回菜单", "back_menu")]
 
 
-openrouter_buttons = _openrouter_buttons()
+def get_keyboard_openrouter() -> InlineKeyboardMarkup:
+    buttons = get_openrouter_buttons()
+    inline = [
+        InlineKeyboardButton(text=text, callback_data=data) for text, data in buttons
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[[btn] for btn in inline])
 
-inline_buttons_openrouter = [
-    InlineKeyboardButton(text=text, callback_data=data) for text, data in openrouter_buttons
-]
 
-keyboard_openrouter = InlineKeyboardMarkup(
-    inline_keyboard=[[button] for button in inline_buttons_openrouter]
-)
+# 兼容旧引用；启动前请先 sync OpenRouter 免费模型
+keyboard_openrouter = get_keyboard_openrouter()

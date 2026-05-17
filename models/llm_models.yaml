@@ -1,5 +1,7 @@
 # LLM 模型与提供商配置（业务层仅通过 services.llm.invoker 访问）
 default_model_id: stepfun-ai/step-3.5-flash
+# 识图/群审图专用（与文字聊天模型分离，不会改写用户菜单里选的模型）
+default_vision_model_id: nvidia/nemotron-nano-12b-v2-vl:free
 
 providers:
   nvidia:
@@ -88,7 +90,7 @@ models:
     callback: gemini_3_pro
     display_name: Gemini 3 Pro
     button_label: Gemini 3 Pro
-    capabilities: [chat]
+    capabilities: [chat, vision]
   - id: gemini-2.0-flash-exp
     key: gemini_2_flash
     provider: gemini
@@ -96,7 +98,7 @@ models:
     callback: gemini_2_flash
     display_name: Gemini 2.0 Flash
     button_label: Gemini 2.0 Flash
-    capabilities: [chat]
+    capabilities: [chat, vision]
   - id: gemini-1.5-pro
     key: gemini_1_5_pro
     provider: gemini
@@ -104,7 +106,7 @@ models:
     callback: gemini_1_5_pro
     display_name: Gemini 1.5 Pro
     button_label: Gemini 1.5 Pro
-    capabilities: [chat]
+    capabilities: [chat, vision]
 
   # --- NVIDIA ---
   - id: stepfun-ai/step-3.5-flash
@@ -113,7 +115,7 @@ models:
     menu: nvidia
     display_name: Step 3.5 Flash
     button_label: "⚡ Step 3.5 Flash (推荐)"
-    capabilities: [chat, stream, tools, vision]
+    capabilities: [chat, stream, tools]
     inference_profile: stepfun_default
   - id: z-ai/glm4.7
     key: glm_4_7
@@ -121,7 +123,7 @@ models:
     menu: nvidia
     display_name: GLM 4.7
     button_label: "🧠 GLM 4.7"
-    capabilities: [chat, stream, tools, vision]
+    capabilities: [chat, stream, tools]
     inference_profile: glm_thinking
   - id: minimaxai/minimax-m2.7
     key: minimax_m2_7
@@ -129,7 +131,7 @@ models:
     menu: nvidia
     display_name: MiniMax M2.7
     button_label: "🎭 MiniMax M2.7"
-    capabilities: [chat, stream, tools, vision]
+    capabilities: [chat, stream, tools]
     inference_profile: minimax_default
   - id: nvidia/nemotron-3-super-120b-a12b
     key: nemotron_3_super
@@ -137,7 +139,7 @@ models:
     menu: nvidia
     display_name: Nemotron 3 Super
     button_label: "🛡️ Nemotron 3 Super"
-    capabilities: [chat, stream, tools, vision]
+    capabilities: [chat, stream, tools]
     inference_profile: nemotron_thinking
   - id: openai/gpt-oss-120b
     key: gpt_oss_120b
@@ -145,7 +147,7 @@ models:
     menu: nvidia
     display_name: GPT-OSS 120B
     button_label: "🔷 GPT-OSS 120B"
-    capabilities: [chat, stream, tools, vision]
+    capabilities: [chat, stream, tools]
     inference_profile: gpt_oss_default
   - id: qwen/qwen3-next-80b-a3b-instruct
     key: qwen3_next
@@ -153,7 +155,7 @@ models:
     menu: nvidia
     display_name: Qwen3 Next 80B
     button_label: "🐉 Qwen3 Next 80B"
-    capabilities: [chat, stream, tools, vision]
+    capabilities: [chat, stream, tools]
     inference_profile: qwen_next_default
   - id: moonshotai/kimi-k2.6
     key: kimi_k2_6
@@ -161,7 +163,7 @@ models:
     menu: nvidia
     display_name: Kimi K2.6
     button_label: "🌙 Kimi K2.6"
-    capabilities: [chat, stream, tools, vision]
+    capabilities: [chat, stream, tools]
     inference_profile: kimi_thinking
   - id: deepseek-ai/deepseek-v4-flash
     key: deepseek_v4_flash
@@ -169,7 +171,7 @@ models:
     menu: nvidia
     display_name: DeepSeek V4 Flash
     button_label: "🐳 DeepSeek V4 Flash"
-    capabilities: [chat, stream, tools, vision]
+    capabilities: [chat, stream, tools]
     inference_profile: deepseek_v4_thinking
   - id: z-ai/glm-5.1
     key: glm_5_1
@@ -177,15 +179,7 @@ models:
     menu: nvidia
     display_name: GLM 5.1
     button_label: "🧠 GLM 5.1"
-    capabilities: [chat, stream, tools, vision]
+    capabilities: [chat, stream, tools]
     inference_profile: glm_thinking
 
-  # --- OpenRouter ---
-  - id: arcee-ai/trinity-large-preview:free
-    key: trinity
-    provider: openrouter
-    menu: openrouter
-    display_name: Trinity (Free)
-    button_label: "⚛️ Trinity (Free)"
-    capabilities: [chat, tools]
-    inference_profile: openrouter_default
+  # --- OpenRouter 免费模型见 models/openrouter_free_models.yaml（scripts/sync_openrouter_free_models.py 生成）---

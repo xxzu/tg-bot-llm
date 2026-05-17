@@ -7,12 +7,21 @@ from datetime import datetime, timedelta
 from aiogram import Router, F
 from aiogram.types import Message
 
+from config.group_admin_help import GROUP_ADMIN_HELP_HTML
 from config.settings import bot
 
 # 导入群组管理模块
 from services.group_admin import group_admin
 
 router = Router()
+
+
+@router.message(F.text.in_({"/grouphelp", "/modhelp", "/adminhelp"}))
+async def group_help_command(message: Message):
+    """群管命令完整说明（群内人人可看，执行仍需管理员权限）。"""
+    if message.chat.type not in ("group", "supergroup", "private"):
+        return
+    await message.answer(GROUP_ADMIN_HELP_HTML, parse_mode="HTML", disable_web_page_preview=True)
 
 
 @router.message(F.text.startswith("/ban"))
@@ -262,90 +271,83 @@ async def violation_stats_command(message: Message):
     await message.reply(stats_text, parse_mode="HTML")
 
 
-@router.message(F.text.startswith("/kwadd"))
-async def keyword_add_command(message: Message):
-    """添加屏蔽词"""
+@router.message(F.text.startswith("/listspam"))
+async def listspam_command(message: Message):
+    """查看广告记录（bayes_spam_sniper /listspam）。"""
+    from services.group_admin.bayes_spam import spam_log
+
     chat_id = message.chat.id
     user_id = message.from_user.id
 
-    if message.chat.type not in ["group", "supergroup", "channel"]:
-        await message.reply("⚠️ 该命令仅支持在群组/频道中使用。")
+    if message.chat.type not in ("group", "supergroup"):
         return
-
     if not await group_admin.is_admin(bot, chat_id, user_id):
         await message.reply("❌ 您没有管理员权限")
         return
-
     if not group_admin.async_init_done:
         await group_admin.init_db()
 
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        await message.reply("用法：/kwadd 关键词")
+    limit = 10
+    parts = (message.text or "").split()
+    if len(parts) > 1:
+        try:
+            limit = max(1, min(int(parts[1]), 30))
+        except ValueError:
+            pass
+
+    entries = await spam_log.list_recent(chat_id, limit=limit)
+    if not entries:
+        await message.reply("📭 暂无广告记录。漏网可回复消息使用 /markspam。")
         return
 
-    keyword = parts[1].strip()
-    added = await group_admin.add_keyword(chat_id, keyword)
-    if added:
-        await message.reply(f"✅ 已添加屏蔽词：<code>{keyword}</code>", parse_mode="HTML")
-    else:
-        await message.reply(f"ℹ️ 屏蔽词已存在或无效：<code>{keyword}</code>", parse_mode="HTML")
+    lines = [f"<b>📋 近期广告记录（最近 {len(entries)} 条）</b>\n"]
+    for e in entries:
+        preview = e.message_text.replace("\n", " ")[:120]
+        who = f"@{e.username}" if e.username else f"uid:{e.user_id}"
+        lines.append(
+            f"\n<b>#{e.id}</b> · p={e.p_spam:.2f} · {e.label} · {who}\n"
+            f"<code>{preview}</code>"
+        )
+    lines.append(
+        "\n\n误杀请发：<code>/markham &lt;编号&gt;</code>\n"
+        "漏网请回复该消息：<code>/markspam</code>"
+    )
+    await message.reply("\n".join(lines), parse_mode="HTML")
 
 
-@router.message(F.text.startswith("/kwdel"))
-async def keyword_del_command(message: Message):
-    """删除屏蔽词"""
+@router.message(F.text.startswith("/listbanuser"))
+async def listbanuser_command(message: Message):
+    """查看封禁列表（bayes_spam_sniper /listbanuser）。"""
     chat_id = message.chat.id
     user_id = message.from_user.id
 
-    if message.chat.type not in ["group", "supergroup", "channel"]:
-        await message.reply("⚠️ 该命令仅支持在群组/频道中使用。")
+    if message.chat.type not in ("group", "supergroup"):
         return
-
     if not await group_admin.is_admin(bot, chat_id, user_id):
         await message.reply("❌ 您没有管理员权限")
         return
-
     if not group_admin.async_init_done:
         await group_admin.init_db()
 
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        await message.reply("用法：/kwdel 关键词")
+    banned = await group_admin.list_banned_users(chat_id)
+    if not banned:
+        await message.reply("📭 当前没有封禁用户。")
         return
 
-    keyword = parts[1].strip()
-    removed = await group_admin.remove_keyword(chat_id, keyword)
-    if removed:
-        await message.reply(f"✅ 已删除屏蔽词：<code>{keyword}</code>", parse_mode="HTML")
-    else:
-        await message.reply(f"ℹ️ 未找到该自定义屏蔽词：<code>{keyword}</code>", parse_mode="HTML")
-
-
-@router.message(F.text == "/kwlist")
-async def keyword_list_command(message: Message):
-    """查看自定义屏蔽词"""
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-
-    if message.chat.type not in ["group", "supergroup", "channel"]:
-        await message.reply("⚠️ 该命令仅支持在群组/频道中使用。")
-        return
-
-    if not await group_admin.is_admin(bot, chat_id, user_id):
-        await message.reply("❌ 您没有管理员权限")
-        return
-
-    if not group_admin.async_init_done:
-        await group_admin.init_db()
-
-    keywords = await group_admin.list_keywords(chat_id)
-    if not keywords:
-        await message.reply("当前没有自定义屏蔽词（默认内置关键词仍会生效）。")
-        return
-
-    body = "\n".join([f"- <code>{kw}</code>" for kw in keywords])
-    await message.reply(f"📋 当前自定义屏蔽词（仅本群/频道生效）：\n{body}", parse_mode="HTML")
+    lines = [f"<b>🚫 封禁列表（{len(banned)} 人）</b>\n"]
+    for row in banned:
+        uid = row["user_id"]
+        try:
+            member = await bot.get_chat_member(chat_id, uid)
+            name = member.user.username or member.user.first_name or str(uid)
+        except Exception:
+            name = str(uid)
+        lines.append(
+            f"\n• @{name} · <code>{uid}</code>\n"
+            f"  原因: {row['reason'] or '—'}"
+        )
+    lines.append("\n解封：回复该用户消息，发送 <code>/unban</code>")
+    await message.reply("\n".join(lines), parse_mode="HTML")
 
 
 # ==================== 忽略用户命令 ====================
@@ -479,4 +481,133 @@ async def ignore_list_command(message: Message):
         f"🙈 <b>被忽略的用户列表</b>（共 {len(ignored_users)} 人）：\n\n{body}",
         parse_mode="HTML"
     )
+
+
+def _user_display_name(user) -> str:
+    return " ".join(
+        filter(None, [getattr(user, "first_name", None), getattr(user, "last_name", None)])
+    ).strip() or getattr(user, "username", None) or ""
+
+
+@router.message(F.text.startswith("/markspam"))
+async def markspam_command(message: Message):
+    """回复违规消息：训练为广告、删除并封禁（参考 bayes_spam_sniper /markspam）。"""
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+
+    if message.chat.type not in ("group", "supergroup"):
+        return
+    if not await group_admin.is_admin(bot, chat_id, user_id):
+        await message.reply("❌ 您没有管理员权限")
+        return
+    if not message.reply_to_message:
+        await message.reply("⚠️ 请回复要标记为广告的消息")
+        return
+
+    if not group_admin.async_init_done:
+        await group_admin.init_db()
+
+    target = message.reply_to_message
+    body = (target.text or target.caption or "").strip()
+    if not body:
+        await message.reply("⚠️ 该消息没有可训练的文本")
+        return
+
+    from services.group_admin.bayes_spam import spam_log
+
+    await group_admin.train_bayes_spam(
+        body, chat_id=chat_id, user_id=target.from_user.id if target.from_user else None
+    )
+    await spam_log.log_detection(
+        chat_id=chat_id,
+        message_id=target.message_id,
+        user_id=target.from_user.id if target.from_user else None,
+        username=(target.from_user.username or target.from_user.first_name)
+        if target.from_user
+        else "",
+        message_text=body,
+        p_spam=1.0,
+        label=spam_log.LABEL_SPAM,
+        source=spam_log.SOURCE_MARKSPAM,
+    )
+    ban_note = ""
+    if target.from_user:
+        name = target.from_user.username or target.from_user.first_name
+        ban_note = f" (@{name})"
+        await group_admin.ban_user(
+            bot, chat_id, target.from_user.id, "管理员 /markspam", banned_by=user_id
+        )
+    await group_admin.delete_message(bot, chat_id, target.message_id)
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    await bot.send_message(
+        chat_id,
+        f"✅ 已标记为广告并训练模型，用户已封禁{ban_note}",
+    )
+
+
+@router.message(F.text.startswith("/markham"))
+async def markham_command(message: Message):
+    """标为正常：/markham <listspam编号> 或回复消息（等同 BSS listspam 标正常）。"""
+    from services.group_admin.bayes_spam import spam_log
+
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+
+    if message.chat.type not in ("group", "supergroup"):
+        return
+    if not await group_admin.is_admin(bot, chat_id, user_id):
+        await message.reply("❌ 您没有管理员权限")
+        return
+    if not group_admin.async_init_done:
+        await group_admin.init_db()
+
+    parts = (message.text or "").split()
+    body: str | None = None
+    if len(parts) >= 2 and parts[1].isdigit():
+        body = await spam_log.mark_log_as_ham(int(parts[1]), chat_id)
+        if not body:
+            await message.reply("⚠️ 未找到该编号记录，请先 /listspam 查看编号")
+            return
+    elif message.reply_to_message:
+        body = (message.reply_to_message.text or message.reply_to_message.caption or "").strip()
+        if not body:
+            await message.reply("⚠️ 该消息没有可训练的文本")
+            return
+    else:
+        await message.reply(
+            "用法：\n• <code>/markham 12</code> — 配合 /listspam 的 #编号\n"
+            "• 回复某条消息 — 将该内容标为正常",
+            parse_mode="HTML",
+        )
+        return
+
+    await group_admin.train_bayes_ham(body, chat_id=chat_id)
+    await message.reply("✅ 已标为正常并训练模型，类似内容不易再被判为广告")
+
+
+@router.message(F.text.startswith("/feedspam"))
+async def feedspam_command(message: Message):
+    """投喂广告样本文本训练（无需回复消息）。"""
+    import logging
+
+    chat_id = message.chat.id
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.reply("用法：/feedspam 广告文本内容…")
+        return
+
+    try:
+        if not group_admin.async_init_done:
+            await group_admin.init_db()
+
+        text = parts[1].strip()
+        scope_chat = chat_id if message.chat.type in ("group", "supergroup") else None
+        await group_admin.train_bayes_spam(text, chat_id=scope_chat)
+        await message.reply("✅ 已投喂广告样本（全局与本群模型已更新）")
+    except Exception as e:
+        logging.exception("feedspam 失败")
+        await message.reply(f"❌ 投喂失败：{e}")
 

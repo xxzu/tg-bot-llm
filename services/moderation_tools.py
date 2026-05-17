@@ -5,14 +5,21 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from aiogram.types import Message
-
-from services import telegram_moderation as mod
+from services.ports.moderation_context import ModerationToolContext
+from services.ports.moderation_port import ModerationPort, get_moderation_port
 
 logger = logging.getLogger(__name__)
+
+# 兼容旧 import 路径
+__all__ = [
+    "OPENAI_MODERATION_TOOLS",
+    "ModerationToolContext",
+    "build_tools_system_addon",
+    "execute_tool",
+    "should_use_group_tools",
+]
 
 OPENAI_MODERATION_TOOLS: List[dict] = [
     {
@@ -20,16 +27,13 @@ OPENAI_MODERATION_TOOLS: List[dict] = [
         "function": {
             "name": "check_message_violation",
             "description": (
-                "检查文本是否命中本群屏蔽词（广告/诈骗/色情/垃圾）。"
+                "贝叶斯检查文本是否为广告/垃圾。"
                 "处置前先检查被引用消息正文。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "待检查文本",
-                    }
+                    "text": {"type": "string", "description": "待检查文本"}
                 },
                 "required": ["text"],
             },
@@ -49,16 +53,9 @@ OPENAI_MODERATION_TOOLS: List[dict] = [
                     "action": {
                         "type": "string",
                         "enum": ["mute", "ban", "kick", "warn", "del"],
-                        "description": "mute禁言 ban封禁 kick踢出 warn警告 del删引用消息",
                     },
-                    "reason": {
-                        "type": "string",
-                        "description": "简短原因",
-                    },
-                    "hours": {
-                        "type": "integer",
-                        "description": "mute 时禁言小时数，1-168，默认24",
-                    },
+                    "reason": {"type": "string"},
+                    "hours": {"type": "integer"},
                 },
                 "required": ["action"],
             },
@@ -75,50 +72,12 @@ OPENAI_MODERATION_TOOLS: List[dict] = [
 ]
 
 
-@dataclass
-class ModerationToolContext:
-    chat_id: int
-    operator_user_id: int
-    requester_is_admin: bool
-    reply_message_id: Optional[int] = None
-    reply_target_user_id: Optional[int] = None
-    reply_text: Optional[str] = None
-    can_moderate: bool = False
-
-    @classmethod
-    async def from_message(cls, message: Message) -> "ModerationToolContext":
-        chat_id = message.chat.id
-        operator = message.from_user.id if message.from_user else 0
-        requester_is_admin = await mod.is_user_group_admin(chat_id, operator)
-        caps = await mod.get_group_capabilities(chat_id)
-
-        reply = message.reply_to_message
-        reply_mid = reply.message_id if reply else None
-        reply_uid = None
-        reply_text = None
-        if reply and reply.from_user:
-            reply_uid = reply.from_user.id
-            reply_text = (reply.text or reply.caption or "").strip() or None
-
-        return cls(
-            chat_id=chat_id,
-            operator_user_id=operator,
-            requester_is_admin=requester_is_admin,
-            reply_message_id=reply_mid,
-            reply_target_user_id=reply_uid,
-            reply_text=reply_text,
-            can_moderate=bool(caps.get("can_moderate")),
-        )
-
-
 def build_tools_system_addon(ctx: ModerationToolContext) -> str:
-    """追加到 system prompt：说明通过 tools 执法，不再使用 @@MOD。"""
     if not ctx.can_moderate:
         return (
             "【群管工具】你在本群无执法权限，不要调用 telegram_moderate。"
             "可提示群管理员为喵喵开启删消息/禁言/封禁权限。"
         )
-
     lines = [
         "【群管工具】你已接入 Telegram 群管 function calling，请用工具执法，不要输出 @@MOD 标记。",
         f"chat_id={ctx.chat_id}，操作者 user_id={ctx.operator_user_id}，"
@@ -127,26 +86,27 @@ def build_tools_system_addon(ctx: ModerationToolContext) -> str:
     if ctx.reply_message_id and ctx.reply_target_user_id:
         lines.append(
             f"用户引用了 message_id={ctx.reply_message_id}，作者 user_id={ctx.reply_target_user_id}。"
-            "telegram_moderate 只处置该作者。"
         )
         if ctx.reply_text:
             lines.append(f"引用正文摘要: {ctx.reply_text[:500]}")
     else:
         lines.append("当前无引用消息：仅可闲聊或建议管理员「回复违规消息后再 @ 你」。")
-
     lines.append(
         "流程建议：明显广告/垃圾时先 check_message_violation(引用正文)，"
         "再 telegram_moderate；处置后用 1～3 句中文向群里说明，勿暴露工具名。"
     )
     if not ctx.requester_is_admin:
-        lines.append(
-            "操作者非群管：仅当 check 命中违规类型时才可 telegram_moderate。"
-        )
+        lines.append("操作者非群管：仅当 check 命中违规类型时才可 telegram_moderate。")
     return "\n".join(lines)
 
 
-async def execute_tool(name: str, arguments: Any, ctx: ModerationToolContext) -> str:
-    """执行单次 tool call，返回 JSON 字符串给模型。"""
+async def execute_tool(
+    name: str,
+    arguments: Any,
+    ctx: ModerationToolContext,
+    port: Optional[ModerationPort] = None,
+) -> str:
+    port = port or get_moderation_port()
     if isinstance(arguments, str):
         try:
             arguments = json.loads(arguments) if arguments.strip() else {}
@@ -157,21 +117,18 @@ async def execute_tool(name: str, arguments: Any, ctx: ModerationToolContext) ->
 
     try:
         if name == "get_group_moderation_status":
-            caps = await mod.get_group_capabilities(ctx.chat_id)
-            text = await mod.get_group_context_text(
+            caps = await port.get_group_capabilities(ctx.chat_id)
+            text = await port.get_group_context_text(
                 ctx.chat_id,
                 requester_user_id=ctx.operator_user_id,
                 reply_message_id=ctx.reply_message_id,
                 reply_author_user_id=ctx.reply_target_user_id,
             )
-            return json.dumps(
-                {"capabilities": caps, "summary": text},
-                ensure_ascii=False,
-            )
+            return json.dumps({"capabilities": caps, "summary": text}, ensure_ascii=False)
 
         if name == "check_message_violation":
             text = str(arguments.get("text") or ctx.reply_text or "")
-            v = await mod.check_text_violation(ctx.chat_id, text)
+            v = await port.check_text_violation(ctx.chat_id, text)
             return json.dumps(
                 {
                     "violation_type": v,
@@ -193,9 +150,9 @@ async def execute_tool(name: str, arguments: Any, ctx: ModerationToolContext) ->
             quoted_is_ad = False
             if ctx.reply_text:
                 quoted_is_ad = (
-                    await mod.check_text_violation(ctx.chat_id, ctx.reply_text) is not None
+                    await port.check_text_violation(ctx.chat_id, ctx.reply_text) is not None
                 )
-            out = await mod.execute_moderation(
+            out = await port.execute_moderation(
                 ctx.chat_id,
                 action,
                 ctx.reply_target_user_id,
@@ -216,7 +173,6 @@ async def execute_tool(name: str, arguments: Any, ctx: ModerationToolContext) ->
 
 
 def should_use_group_tools(chat_type: str, model_spec) -> bool:
-    """model_spec: services.llm.registry.ModelSpec 或 None。"""
     from config.performance import GROUP_MOD_TOOLS_ENABLED
 
     if not GROUP_MOD_TOOLS_ENABLED:

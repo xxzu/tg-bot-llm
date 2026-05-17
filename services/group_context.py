@@ -11,6 +11,7 @@ from services.moderation_tools import (
     build_tools_system_addon,
 )
 from services import telegram_moderation as mod
+from services.telegram_admin_perms import admin_has_perm
 
 
 async def build_group_system_addon(
@@ -62,13 +63,11 @@ async def _build_legacy_context(bot: Bot, message: Message) -> str:
     perms = []
     if isinstance(bot_member, ChatMemberAdministrator):
         m = bot_member
-        for ok, label in (
-            (m.can_delete_messages, "删除消息"),
-            (m.can_restrict_members, "限制成员(禁言)"),
-            (m.can_ban_users, "封禁/踢人"),
-        ):
-            if ok:
-                perms.append(label)
+        if admin_has_perm(m, "can_delete_messages"):
+            perms.append("删除消息")
+        if admin_has_perm(m, "can_restrict_members", "can_ban_users"):
+            perms.append("限制成员(禁言)")
+            perms.append("封禁/踢人")
 
     perm_text = "、".join(perms) if perms else "（未勾选删消息/禁言/封禁等）"
 

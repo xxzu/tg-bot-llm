@@ -4,23 +4,31 @@
 """
 from aiogram import Router, F, types
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import CallbackQuery
 
 from config.settings import OWNER_ID, formatted_datetime
-from config.buttons import keyboard, keyboard_pic, keyboard_voice, keyboard_nvidia, keyboard_openrouter
-from services.llm.registry import get_registry
+from config.buttons import (
+    keyboard,
+    keyboard_pic,
+    keyboard_voice,
+    keyboard_nvidia,
+    get_keyboard_openrouter,
+)
+from services.llm.registry import format_model_display, get_registry
 from config.text import system_message_text
-from models.database import get_or_create_user_data, save_user_data
+from models.database import (
+    get_chat_settings_data,
+    get_or_create_user_data,
+    model_storage_ids,
+    save_user_data,
+)
 from utils.helpers import generate_history, send_history
 from config.settings import bot
 
 router = Router()
 
 
-class ChangeValueState(StatesGroup):
-    """系统角色设置状态"""
-    waiting_for_new_value = State()
+from handlers.states import ChangeValueState
 
 
 def _is_llm_model_select_callback(callback: CallbackQuery) -> bool:
@@ -31,11 +39,10 @@ def _is_llm_model_select_callback(callback: CallbackQuery) -> bool:
 
 def _model_storage_ids(callback_query: CallbackQuery) -> tuple[int, int]:
     """私聊用 user_id；群聊模型存在群组维度 (chat_id, chat_id)。"""
-    user_id = callback_query.from_user.id
-    chat_id = callback_query.message.chat.id
-    if callback_query.message.chat.type in ("group", "supergroup"):
-        return chat_id, chat_id
-    return user_id, chat_id
+    msg = callback_query.message
+    return model_storage_ids(
+        callback_query.from_user.id, msg.chat.id, msg.chat.type
+    )
 
 
 async def _apply_llm_model_from_callback(
@@ -76,7 +83,7 @@ FEATURE_LIST_TEXT = """
 
 <b>━━━ 🎯 核心 AI 功能 ━━━</b>
 • <b>文本对话</b> - 与 Gemini AI 多轮对话，支持上下文记忆
-• <b>图片理解</b> - 发送图片，AI 描述图片内容
+• <b>图片理解</b> - 私聊发图：AI 描述内容；群内新人/首图：视觉审图（违规删图+简短说明）
 • <b>语音输入</b> - 发送语音消息，自动转文字后发给 AI
 • <b>语音回复</b> - 可选开启 AI 回复的语音版本
 
@@ -91,7 +98,7 @@ FEATURE_LIST_TEXT = """
 • <b>系统角色</b> - 自定义 AI 的角色/人设
 
 <b>━━━ 👥 群组功能 ━━━</b>
-• <b>唤醒词</b> - 消息含「喵」或「晚安」时响应
+• <b>唤醒词</b> - 消息含「喵」「喵喵」或「晚安」时响应
 • <b>@机器人</b> - 在群组中 @机器人发消息
 • <b>回复机器人</b> - 回复机器人的消息继续对话
 
@@ -106,13 +113,16 @@ FEATURE_LIST_TEXT = """
 • <code>/ignore</code> - 忽略用户（不回复）
 • <code>/unignore</code> - 取消忽略
 • <code>/ignorelist</code> - 忽略列表
-• <code>/kwadd</code> - 添加屏蔽词
-• <code>/kwdel</code> - 删除屏蔽词
-• <code>/kwlist</code> - 屏蔽词列表
+• <code>/markspam</code> - 标记广告并训练
+• <code>/listspam</code> - 广告记录列表
+• <code>/listbanuser</code> - 封禁列表
+• <code>/feedspam</code> - 投喂广告样本
+• <code>/markham</code> - 标为正常（纠正误杀）
+• <code>/grouphelp</code> - 完整说明
 
-<b>━━━ 🚫 自动内容过滤 ━━━</b>
-• 自动检测并删除诈骗/色情/垃圾信息
-• 违规用户自动警告，多次违规自动封禁
+<b>━━━ 🚫 贝叶斯广告拦截 ━━━</b>
+• 自动识别广告并删消息；累计 3 次封禁（可配置）
+• 详见 <code>/grouphelp</code>
 """
 
 
@@ -184,20 +194,24 @@ ADMIN_COMMANDS_TEXT = """
 查看违规统计
 示例：<code>/stats 7</code> 查看最近7天
 
-<b>━━━ 🚫 屏蔽词管理 ━━━</b>
+<b>━━━ 🧠 贝叶斯广告（BSS 同款）━━━</b>
 
-<code>/kwadd 关键词</code>
-添加自定义屏蔽词
-示例：<code>/kwadd 广告</code>
+<code>/markspam</code>
+回复垃圾消息：删除、封禁、训练模型
 
-<code>/kwdel 关键词</code>
-删除自定义屏蔽词
-示例：<code>/kwdel 广告</code>
+<code>/listspam</code>
+查看广告记录；误杀 <code>/markham 编号</code>
 
-<code>/kwlist</code>
-查看本群自定义屏蔽词列表
+<code>/listbanuser</code>
+封禁列表；解封请 <code>/unban</code>
 
-<i>💡 提示：所有管理命令仅群组管理员可用</i>
+<code>/feedspam 文本</code>
+投喂广告样本
+
+<code>/grouphelp</code>
+完整群管说明
+
+<i>💡 提示：/markspam /listspam /listbanuser 等需群组管理员；/feedspam 人人可用</i>
 """
 
 
@@ -509,13 +523,19 @@ async def process_callback_info(callback_query: CallbackQuery, state: FSMContext
         await state.clear()
 
     user_data = await get_or_create_user_data(user_id, chat_id)
+    settings = await get_chat_settings_data(
+        user_id, chat_id, callback_query.message.chat.type
+    )
+    model_label = format_model_display(settings.model, settings.model_message_info)
 
     info_voice_answer = "已启用" if user_data.voice_answer else "已禁用"
-    info_system_message = "未设置" if not user_data.system_message else user_data.system_message
+    info_system_message = (
+        "未设置" if not settings.system_message else settings.system_message
+    )
 
     info_messages = (
         f"<i>总消息数：</i> <b>{user_data.count_messages}</b>\n"
-        f"<i>当前模型：</i> <b>{user_data.model_message_info}</b>\n"
+        f"<i>当前模型：</i> <b>{model_label}</b>\n"
         f"<i>语音回复：</i> <b>{info_voice_answer}</b>\n"
         f"<i>机器人启动时间：</i> <b>{formatted_datetime}</b>\n"
         f"<i>您的用户 ID：</i> <b>{user_id}</b>\n"
@@ -562,9 +582,10 @@ async def process_callback_delete_value(callback_query: CallbackQuery, state: FS
     if state is not None:
         await state.clear()
 
-    user_data = await get_or_create_user_data(user_id, chat_id)
-    user_data.system_message = ""
-    await save_user_data(user_id, chat_id)
+    storage_uid, storage_cid = _model_storage_ids(callback_query)
+    settings = await get_or_create_user_data(storage_uid, storage_cid)
+    settings.system_message = ""
+    await save_user_data(storage_uid, storage_cid)
 
     await callback_query.message.edit_text(
         text="<b>系统角色已删除</b>",
@@ -693,7 +714,7 @@ async def process_callback_openrouter_models(callback_query: CallbackQuery, stat
     await callback_query.message.edit_text(
         text="🌐 <b>选择 OpenRouter 模型</b>\n\n"
              "支持更多外部模型，如 Arcee Trinity。\n",
-        reply_markup=keyboard_openrouter,
+        reply_markup=get_keyboard_openrouter(),
         parse_mode="HTML"
     )
     await callback_query.answer()

@@ -12,6 +12,7 @@ from aiogram.types import ChatMemberAdministrator, ChatMemberOwner
 
 from config.settings import TOKEN
 from services.group_admin import group_admin
+from services.telegram_admin_perms import collect_admin_permissions
 
 _bot: Optional[Bot] = None
 
@@ -58,18 +59,7 @@ async def get_group_capabilities(chat_id: int) -> Dict[str, Any]:
     elif isinstance(member, ChatMemberAdministrator):
         out["role"] = "administrator"
         out["is_bot_admin"] = True
-        perms = []
-        if member.can_delete_messages:
-            perms.append("delete_messages")
-        if member.can_restrict_members:
-            perms.append("restrict_members")
-        if member.can_ban_users:
-            perms.append("ban_users")
-        if member.can_pin_messages:
-            perms.append("pin_messages")
-        if member.can_manage_chat:
-            perms.append("manage_chat")
-        out["permissions"] = perms
+        out["permissions"] = collect_admin_permissions(member)
     else:
         out["role"] = getattr(member, "status", "member")
 
@@ -133,11 +123,13 @@ async def get_group_context_text(
 
 
 async def check_text_violation(chat_id: int, text: str) -> Optional[str]:
-    """检查文本是否命中屏蔽词，返回 violation_type 或 None。"""
+    """检查文本是否违规（仅贝叶斯），返回 violation_type 或 None。"""
     await ensure_group_admin_db()
     if not text:
         return None
-    return group_admin.check_keywords(chat_id, text)
+    if await group_admin.check_bayes_spam(chat_id, text):
+        return "spam"
+    return None
 
 
 async def is_user_group_admin(chat_id: int, user_id: int) -> bool:
@@ -182,16 +174,6 @@ async def kick_user(chat_id: int, user_id: int, reason: str = "") -> bool:
 async def unban_user(chat_id: int, user_id: int) -> bool:
     bot = get_bot()
     return await group_admin.unban_user(bot, chat_id, user_id)
-
-
-async def add_keyword(chat_id: int, keyword: str) -> bool:
-    await ensure_group_admin_db()
-    return await group_admin.add_keyword(chat_id, keyword)
-
-
-async def list_keywords(chat_id: int) -> List[str]:
-    await ensure_group_admin_db()
-    return await group_admin.list_keywords(chat_id)
 
 
 async def get_violation_stats(chat_id: int, days: int = 7) -> Dict[str, Any]:
@@ -240,7 +222,7 @@ async def execute_moderation(
     if require_operator_admin and operator_user_id:
         if not await group_admin.is_admin(bot, chat_id, operator_user_id):
             if allow_if_target_text_is_spam and target_message_text:
-                if group_admin.check_keywords(chat_id, target_message_text) is None:
+                if await group_admin.check_bayes_spam(chat_id, target_message_text) is None:
                     allowed = False
             else:
                 allowed = False
