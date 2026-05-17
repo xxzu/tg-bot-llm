@@ -331,22 +331,18 @@ async def listbanuser_command(message: Message):
 
     banned = await group_admin.list_banned_users(chat_id)
     if not banned:
-        await message.reply("📭 当前没有封禁用户。")
+        await message.reply("📭 当前没有封禁记录。")
         return
 
-    lines = [f"<b>🚫 封禁列表（{len(banned)} 人）</b>\n"]
+    lines = [f"<b>🚫 封禁列表（{len(banned)} 条）</b>\n"]
     for row in banned:
-        uid = row["user_id"]
-        try:
-            member = await bot.get_chat_member(chat_id, uid)
-            name = member.user.username or member.user.first_name or str(uid)
-        except Exception:
-            name = str(uid)
-        lines.append(
-            f"\n• @{name} · <code>{uid}</code>\n"
-            f"  原因: {row['reason'] or '—'}"
+        desc = await group_admin.describe_banned_member(
+            bot, chat_id, row["user_id"]
         )
-    lines.append("\n解封：回复该用户消息，发送 <code>/unban</code>")
+        lines.append(group_admin.format_ban_list_line(row, desc))
+    lines.append(
+        "\n解封：回复该用户/机器人消息，发送 <code>/unban</code>"
+    )
     await message.reply("\n".join(lines), parse_mode="HTML")
 
 
@@ -513,38 +509,81 @@ async def markspam_command(message: Message):
         await message.reply("⚠️ 该消息没有可训练的文本")
         return
 
+    from config.performance import SPAM_ESCALATE_ACTION
     from services.group_admin.bayes_spam import spam_log
+    from utils.moderation_actor import resolve_moderation_actor
+
+    actor = await resolve_moderation_actor(target, group_admin)
+    log_user_id = actor.user_id if actor else (
+        target.from_user.id if target.from_user else None
+    )
+    log_username = (
+        actor.username
+        if actor
+        else (
+            (target.from_user.username or target.from_user.first_name)
+            if target.from_user
+            else ""
+        )
+    )
 
     await group_admin.train_bayes_spam(
-        body, chat_id=chat_id, user_id=target.from_user.id if target.from_user else None
+        body, chat_id=chat_id, user_id=log_user_id
     )
     await spam_log.log_detection(
         chat_id=chat_id,
         message_id=target.message_id,
-        user_id=target.from_user.id if target.from_user else None,
-        username=(target.from_user.username or target.from_user.first_name)
-        if target.from_user
-        else "",
+        user_id=log_user_id,
+        username=log_username,
         message_text=body,
         p_spam=1.0,
         label=spam_log.LABEL_SPAM,
         source=spam_log.SOURCE_MARKSPAM,
     )
-    ban_note = ""
-    if target.from_user:
-        name = target.from_user.username or target.from_user.first_name
-        ban_note = f" (@{name})"
+
+    ban_notes: list[str] = []
+    if actor:
         await group_admin.ban_user(
-            bot, chat_id, target.from_user.id, "管理员 /markspam", banned_by=user_id
+            bot,
+            chat_id,
+            actor.user_id,
+            "管理员 /markspam",
+            banned_by=user_id,
         )
+        ban_notes.append(f"真人 @{actor.username}（<code>{actor.user_id}</code>）")
+        if actor.bot_sender_id:
+            bot_note = await group_admin._remove_associated_spam_bot(
+                bot,
+                chat_id,
+                actor.bot_sender_id,
+                "管理员 /markspam",
+                use_ban=SPAM_ESCALATE_ACTION == "ban",
+            )
+            if bot_note:
+                ban_notes.append(bot_note)
+    elif target.from_user:
+        fu = target.from_user
+        await group_admin.ban_user(
+            bot, chat_id, fu.id, "管理员 /markspam", banned_by=user_id
+        )
+        name = fu.username or fu.first_name or str(fu.id)
+        if fu.is_bot:
+            ban_notes.append(
+                f"机器人 @{name}（<code>{fu.id}</code>，未绑定真人）"
+            )
+        else:
+            ban_notes.append(f"@{name}（<code>{fu.id}</code>）")
+
     await group_admin.delete_message(bot, chat_id, target.message_id)
     try:
         await message.delete()
     except Exception:
         pass
+    detail = "；".join(ban_notes) if ban_notes else "（无封禁对象）"
     await bot.send_message(
         chat_id,
-        f"✅ 已标记为广告并训练模型，用户已封禁{ban_note}",
+        f"✅ 已标记为广告并训练模型。封禁：{detail}",
+        parse_mode="HTML",
     )
 
 

@@ -29,6 +29,7 @@ from services.group_admin.image_moderation import moderate_group_photo
 from services.voice import process_voice_message, text_to_speech
 from utils.bot_cache import get_bot_info
 from utils.markdown import clean_text_for_tts
+from utils.moderation_actor import moderation_subject_user_id as _moderation_subject_user_id
 
 router = Router()
 
@@ -108,7 +109,8 @@ async def _ensure_group_gate(bot, message: Message) -> bool:
         return False
     if not group_admin.async_init_done:
         await group_admin.init_db()
-    if group_admin.is_ignored(message.chat.id, message.from_user.id):
+    subject_id = await _moderation_subject_user_id(message, group_admin)
+    if subject_id is not None and group_admin.is_ignored(message.chat.id, subject_id):
         return True
     return await group_admin.check_and_handle_message(bot, message)
 

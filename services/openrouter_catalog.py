@@ -73,12 +73,13 @@ def model_id_to_key(model_id: str) -> str:
 
 
 def _capabilities(raw: Dict[str, Any]) -> tuple[str, ...]:
-    caps: List[str] = ["chat"]
+    caps: List[str] = ["chat", "stream"]
     params = raw.get("supported_parameters") or []
     if "tools" in params:
         caps.append("tools")
     arch = raw.get("architecture") or {}
     in_mod = arch.get("input_modalities") or []
+    out_mod = arch.get("output_modalities") or []
     # 仅当明确支持视觉理解时再标记（避免 Lyria 等音频模型误标）
     modality = str(arch.get("modality") or "")
     if "vision" in params or (

@@ -12,17 +12,19 @@ GROUP_ADMIN_HELP_HTML = """
 
 <b>━━ 自动行为（无需命令）━━</b>
 • 贝叶斯判定为广告（默认概率 ≥ 94%）→ <b>删除消息 + 群内警告</b>（含群管理员发的广告，第 n/3 次）
-• 同一用户累计警告达 <code>SPAM_BAN_THRESHOLD</code> 次（默认 3）→ 踢出或封禁（<code>SPAM_ESCALATE_ACTION</code>，默认 kick）
+• 同一用户累计警告达 <code>SPAM_BAN_THRESHOLD</code> 次（默认 3）→ 踢出或封禁真人；若为访客/绑定机器人发广告，<b>同时移出该机器人</b>
 • 另含汉字故意加空格规则（如「跟 单 像 捡 钱」）
+• <b>访客 AI 机器人</b>发的广告：按 <code>guest_bot_caller_user</code> 归责；同群同机器人一旦绑定过真人，后续无 caller 字段的广告仍算在该用户头上
+• 普通机器人发的广告：可删帖；若从未绑定过真人则无法计次警告
 • <b>新人 / 首图 / 入群不足 7 天</b> 发图 → 视觉审核（广告/诈骗/色情等）；违规则删图并在群内<b>简短说明</b>，不做闲聊识图
 
 <b>━━ 官方四类命令（与 BSS 一致）━━</b>
 
 <b>/markspam</b> 🔒
-回复要处理的垃圾消息。删除消息、封禁用户，并以该文本<b>训练为广告</b>（高置信度，全群模型受益）。
+回复要处理的垃圾消息。删除消息、<b>训练为广告</b>；若为目标为访客机器人且带 <code>guest_bot_caller_user</code> 或历史绑定，则<b>封禁真人并移出对应机器人</b>；仅机器人且无绑定则封禁机器人并标注「未绑定真人」。
 
 <b>/listbanuser</b> 🔒
-查看本群已封禁用户列表。解封：回复该用户任意消息，发送 <code>/unban</code>。
+查看本群封禁列表（区分 👤 真人与 🤖 机器人；机器人显示绑定真人 ID 或「未绑定真人」）。解封：回复该用户/机器人消息，发送 <code>/unban</code>。
 
 <b>/listspam</b> 🔒
 查看近期被判定/记录的广告消息（含自动删除的条目）。
@@ -48,6 +50,7 @@ GROUP_ADMIN_HELP_HTML = """
 <code>BAYES_SPAM_ENABLED</code> · <code>BAYES_SPAM_THRESHOLD</code>（默认 0.94）
 <code>SPAM_BAN_THRESHOLD</code>（默认 3）· <code>SPAM_ESCALATE_ACTION</code>（kick/ban）
 <code>BAYES_CHINESE_SPACE_THRESHOLD</code>
+<code>MODERATE_OTHER_BOT_MESSAGES</code>（默认 1，是否扫描其他机器人消息）
 <code>GROUP_IMAGE_MOD_ENABLED</code> · <code>GROUP_IMAGE_VIOLATION_CONFIDENCE</code>（默认 0.72）
 
 <b>误删怎么办？</b>

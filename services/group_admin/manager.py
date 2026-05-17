@@ -16,6 +16,7 @@ from aiogram.types import ChatMemberAdministrator, ChatMemberOwner, ChatPermissi
 
 logger = logging.getLogger(__name__)
 
+from services.group_admin.guest_bot_bindings import GuestBotBindingStore
 from services.group_admin.repo import DB_FILE
 
 # 兼容旧 import（关键词模块已停用，仅保留符号）
@@ -31,6 +32,7 @@ class GroupAdmin:
         self.banned_users: Dict[int, Set[int]] = {}
         # 每个 chat 的被忽略用户集合 {chat_id: {user_id, ...}}
         self.ignored_users: Dict[int, Set[int]] = {}
+        self.guest_bot_bindings = GuestBotBindingStore()
         self.async_init_done = False
     
     async def init_db(self):
@@ -112,7 +114,10 @@ class GroupAdmin:
                 )
             """)
             
+            await self.guest_bot_bindings.ensure_table(conn)
             await conn.commit()
+
+        await self.guest_bot_bindings.load_all()
         
         # 加载已封禁用户（按群）
         async with aiosqlite.connect(DB_FILE) as conn:
@@ -141,6 +146,22 @@ class GroupAdmin:
     
     def is_user_banned_in_chat(self, chat_id: int, user_id: int) -> bool:
         return user_id in self.banned_users.get(chat_id, set())
+
+    async def bind_guest_bot_caller(
+        self,
+        chat_id: int,
+        bot_user_id: int,
+        caller_user_id: int,
+        caller_username: str = "",
+    ) -> None:
+        await self.guest_bot_bindings.bind(
+            chat_id, bot_user_id, caller_user_id, caller_username
+        )
+
+    async def lookup_guest_bot_caller(
+        self, chat_id: int, bot_user_id: int
+    ) -> Optional[tuple[int, str]]:
+        return await self.guest_bot_bindings.lookup(chat_id, bot_user_id)
 
     async def is_admin(self, bot: Bot, chat_id: int, user_id: int) -> bool:
         """检查用户是否为管理员"""
@@ -346,6 +367,45 @@ class GroupAdmin:
         except Exception as e:
             logger.error(f"踢出用户失败: {e}")
             return False
+
+    async def _remove_associated_spam_bot(
+        self,
+        bot: Bot,
+        chat_id: int,
+        bot_user_id: Optional[int],
+        reason: str,
+        *,
+        use_ban: bool,
+    ) -> str:
+        """踢出/封禁发送广告的机器人；返回可追加到群内提示的短句。"""
+        if not bot_user_id:
+            return ""
+        try:
+            me = await bot.get_me()
+            if bot_user_id == me.id:
+                return ""
+        except Exception:
+            pass
+        if await self.is_admin(bot, chat_id, bot_user_id):
+            logger.warning("广告机器人 %s 为群管理员，无法移出", bot_user_id)
+            return "对应机器人为群管理员，无法移出"
+        bot_reason = f"{reason}（广告机器人）"
+        if use_ban:
+            ok = await self.ban_user(
+                bot, chat_id, bot_user_id, bot_reason, banned_by=bot.id
+            )
+            text = "已封禁对应机器人" if ok else "封禁对应机器人失败"
+        else:
+            ok = await self.kick_user(bot, chat_id, bot_user_id, bot_reason)
+            text = "已移出对应机器人" if ok else "移出对应机器人失败"
+        logger.info(
+            "广告机器人处置 chat_id=%s bot_id=%s use_ban=%s ok=%s",
+            chat_id,
+            bot_user_id,
+            use_ban,
+            ok,
+        )
+        return text
     
     async def mute_user(self, bot: Bot, chat_id: int, user_id: int, until_date: datetime = None) -> bool:
         """禁言用户"""
@@ -445,25 +505,56 @@ class GroupAdmin:
         """贝叶斯/规则判定为广告：删消息、记日志、警告；满额后再踢出/封禁。"""
         from config.performance import SPAM_BAN_THRESHOLD, SPAM_ESCALATE_ACTION
         from services.group_admin.bayes_spam import spam_log
+        from utils.moderation_actor import (
+            log_message_sender_context,
+            log_moderation_actor_resolution,
+            resolve_moderation_actor,
+        )
 
         chat_id = message.chat.id
-        user = message.from_user
-        if not user:
-            return False
-        user_id = user.id
-        username = user.username or user.first_name or str(user_id)
         message_text = (message.text or message.caption or "").strip()
-        mention = f"@{username}" if username and not username.isdigit() else username
+        log_message_sender_context(message, tag="handle_bayes_spam")
+        actor = await resolve_moderation_actor(message, self)
+        log_moderation_actor_resolution(message, actor, tag="handle_bayes_spam")
+
+        if actor is None:
+            return await self._handle_bot_only_spam(
+                bot, message, chat_id=chat_id, message_text=message_text, p_spam=p_spam
+            )
+
+        user_id = actor.user_id
+        username = actor.username
+        mention = actor.mention
         is_tg_admin = await self.is_admin(bot, chat_id, user_id)
+        if actor.via_guest_binding:
+            guest_note = "（该访客/广告机器人已绑定此前触发用户，继续归责并计次。）"
+        elif actor.via_guest_bot:
+            guest_note = "（通过访客 AI 机器人发送，已归责于该用户。）"
+        else:
+            guest_note = ""
 
         if self.is_user_banned_in_chat(chat_id, user_id):
             notice = f"🚫 {mention} 已被封禁，本条广告已删除。"
+            if actor.via_guest_bot and actor.bot_sender_id:
+                bot_note = await self._remove_associated_spam_bot(
+                    bot,
+                    chat_id,
+                    actor.bot_sender_id,
+                    "封禁用户复犯广告",
+                    use_ban=SPAM_ESCALATE_ACTION == "ban",
+                )
+                if bot_note:
+                    notice += f" {bot_note}。"
             sent = await self._notify_spam_warning(bot, message, chat_id, notice)
             deleted = await self.delete_message(bot, chat_id, message.message_id)
             logger.info(
-                "bayes spam 封禁用户复犯 chat_id=%s user=%s notice_sent=%s deleted=%s",
+                "bayes spam 封禁用户复犯 chat_id=%s user=%s guest=%s binding=%s bot_sender=%s "
+                "notice_sent=%s deleted=%s",
                 chat_id,
                 user_id,
+                actor.via_guest_bot,
+                actor.via_guest_binding,
+                actor.bot_sender_id,
                 sent,
                 deleted,
             )
@@ -509,6 +600,16 @@ class GroupAdmin:
             else:
                 ok = await self.kick_user(bot, chat_id, user_id, reason)
                 action_text = "已踢出群组" if ok else "踢出失败（请检查机器人权限）"
+            if actor.via_guest_bot and actor.bot_sender_id:
+                bot_note = await self._remove_associated_spam_bot(
+                    bot,
+                    chat_id,
+                    actor.bot_sender_id,
+                    reason,
+                    use_ban=SPAM_ESCALATE_ACTION == "ban",
+                )
+                if bot_note:
+                    action_text = f"{action_text}；{bot_note}"
             notice = (
                 f"🚫 {mention} 触发广告规则，"
                 f"累计警告 {warn_n} 次（满 {threshold} 次），{action_text}。"
@@ -524,6 +625,8 @@ class GroupAdmin:
             )
         if is_tg_admin:
             notice += "（发送者为群管理员，仍会删帖；满额后可能无法踢出/封禁该管理员。）"
+        if guest_note:
+            notice += guest_note
 
         # 必须先提示再删帖，否则用户只看到消息消失
         sent = await self._notify_spam_warning(bot, message, chat_id, notice)
@@ -535,14 +638,23 @@ class GroupAdmin:
                 message.message_id,
             )
 
+        action = "贝叶斯删除并警告"
+        if actor.via_guest_binding:
+            action = "访客机器人广告(历史绑定)，归责用户并警告"
+        elif actor.via_guest_bot:
+            action = "访客机器人广告，归责用户并警告"
         await self.record_violation(
-            chat_id, user_id, username, message_text, "spam", "贝叶斯删除并警告"
+            chat_id, user_id, username, message_text, "spam", action
         )
 
         logger.info(
-            "bayes spam 处置 chat_id=%s user=%s p=%.3f warn=%s/%s notice_sent=%s deleted=%s text=%r",
+            "bayes spam 处置 chat_id=%s punish_user_id=%s guest=%s binding=%s "
+            "bot_sender_id=%s p=%.3f warn=%s/%s notice_sent=%s deleted=%s text=%r",
             chat_id,
             user_id,
+            actor.via_guest_bot,
+            actor.via_guest_binding,
+            actor.bot_sender_id,
             p_spam,
             warn_n,
             threshold,
@@ -556,6 +668,64 @@ class GroupAdmin:
                 chat_id,
                 user_id,
             )
+        return True
+
+    async def _handle_bot_only_spam(
+        self,
+        bot: Bot,
+        message: types.Message,
+        *,
+        chat_id: int,
+        message_text: str,
+        p_spam: float,
+    ) -> bool:
+        """其他机器人发的广告：只删帖；无 guest_bot_caller_user 时无法定位真人。"""
+        from services.group_admin.bayes_spam import spam_log
+        from utils.moderation_actor import log_message_sender_context
+
+        sender = message.from_user
+        if not sender or not sender.is_bot:
+            return False
+
+        from config.performance import SPAM_ESCALATE_ACTION
+
+        log_message_sender_context(message, tag="bot_only_spam")
+        bot_name = sender.username or sender.first_name or str(sender.id)
+        bot_note = await self._remove_associated_spam_bot(
+            bot,
+            chat_id,
+            sender.id,
+            "机器人发送广告",
+            use_ban=SPAM_ESCALATE_ACTION == "ban",
+        )
+        notice = (
+            f"🤖 已删除机器人 @{bot_name} 发送的广告内容。"
+            "（未绑定真人，无法计次警告。）"
+        )
+        if bot_note:
+            notice += f" {bot_note}。"
+        sent = await self._notify_spam_warning(bot, message, chat_id, notice)
+        deleted = await self.delete_message(bot, chat_id, message.message_id)
+        await spam_log.log_detection(
+            chat_id=chat_id,
+            message_id=message.message_id,
+            user_id=sender.id,
+            username=bot_name,
+            message_text=message_text,
+            p_spam=p_spam,
+            label=spam_log.LABEL_MAYBE_SPAM,
+            source="bot_sender",
+        )
+        logger.info(
+            "bayes spam 机器人消息 chat_id=%s bot_id=%s bot_username=%s "
+            "guest_caller_id=None notice_sent=%s deleted=%s text=%r",
+            chat_id,
+            sender.id,
+            bot_name,
+            sent,
+            deleted,
+            message_text[:80],
+        )
         return True
 
     async def handle_vision_image_violation(
@@ -641,6 +811,14 @@ class GroupAdmin:
 
     async def check_and_handle_message(self, bot: Bot, message: types.Message) -> bool:
         """仅贝叶斯广告识别（含 BSS 汉字空格规则），自动删消息。"""
+        from config.performance import MODERATE_OTHER_BOT_MESSAGES
+        from utils.moderation_actor import (
+            log_message_sender_context,
+            log_moderation_actor_resolution,
+            message_sent_by_other_bot,
+            resolve_moderation_actor,
+        )
+
         if message.chat.type not in ["group", "supergroup", "channel"]:
             return False
 
@@ -651,8 +829,25 @@ class GroupAdmin:
         if message_text.startswith("/"):
             return False
 
-        display = ""
-        if message.from_user:
+        actor = await resolve_moderation_actor(message, self)
+        if message_sent_by_other_bot(message) or getattr(
+            message, "guest_bot_caller_user", None
+        ):
+            log_message_sender_context(message, tag="check_and_handle")
+            log_moderation_actor_resolution(message, actor, tag="check_and_handle")
+        if message_sent_by_other_bot(message) and actor is None:
+            if not MODERATE_OTHER_BOT_MESSAGES:
+                return False
+            # 跳过自己的消息
+            try:
+                me = await bot.get_me()
+                if message.from_user and message.from_user.id == me.id:
+                    return False
+            except Exception:
+                pass
+
+        display = actor.display_name if actor else ""
+        if not display and message.from_user:
             display = " ".join(
                 filter(
                     None,
@@ -677,6 +872,42 @@ class GroupAdmin:
             return True
 
         return False
+
+    async def describe_banned_member(
+        self, bot: Bot, chat_id: int, user_id: int
+    ) -> dict:
+        """封禁列表展示用：区分真人/机器人及访客绑定关系。"""
+        is_bot = False
+        display_name = str(user_id)
+        try:
+            member = await bot.get_chat_member(chat_id, user_id)
+            u = member.user
+            is_bot = bool(u.is_bot)
+            display_name = u.username or u.first_name or str(user_id)
+        except Exception:
+            pass
+
+        bound_caller_id: Optional[int] = None
+        bound_caller_name = ""
+        if is_bot:
+            hit = await self.lookup_guest_bot_caller(chat_id, user_id)
+            if hit:
+                bound_caller_id, bound_caller_name = hit[0], hit[1]
+
+        linked_bot_ids: List[int] = []
+        if not is_bot:
+            linked_bot_ids = await self.guest_bot_bindings.list_bots_for_caller_async(
+                chat_id, user_id
+            )
+
+        return {
+            "user_id": user_id,
+            "display_name": display_name,
+            "is_bot": is_bot,
+            "bound_caller_id": bound_caller_id,
+            "bound_caller_name": bound_caller_name,
+            "linked_bot_ids": linked_bot_ids,
+        }
 
     async def list_banned_users(self, chat_id: int) -> List[dict]:
         """本群封禁列表（供 /listbanuser）。"""
@@ -704,6 +935,39 @@ class GroupAdmin:
                 }
             )
         return out
+
+    def format_ban_list_line(self, row: dict, desc: dict) -> str:
+        """生成单条封禁记录的 HTML 行。"""
+        uid = row["user_id"]
+        reason = row["reason"] or "—"
+        name = desc["display_name"]
+        label = f"@{name}" if name and not str(name).isdigit() else name
+
+        if desc["is_bot"]:
+            if desc["bound_caller_id"]:
+                caller = desc["bound_caller_name"] or str(desc["bound_caller_id"])
+                caller_label = (
+                    f"@{caller}"
+                    if caller and not str(caller).isdigit()
+                    else str(desc["bound_caller_id"])
+                )
+                kind = (
+                    f"🤖 机器人 {label} · <code>{uid}</code>\n"
+                    f"  └ 绑定真人 {caller_label} · <code>{desc['bound_caller_id']}</code>"
+                )
+            else:
+                kind = (
+                    f"🤖 机器人 {label} · <code>{uid}</code>\n"
+                    f"  └ <i>未绑定真人</i>（/markspam 时未记录 guest_bot_caller）"
+                )
+        else:
+            kind = f"👤 真人 {label} · <code>{uid}</code>"
+            bots = desc.get("linked_bot_ids") or []
+            if bots:
+                bot_ids = ", ".join(f"<code>{b}</code>" for b in bots)
+                kind += f"\n  └ 关联机器人: {bot_ids}"
+
+        return f"\n• {kind}\n  原因: {reason}"
     
     async def get_violation_stats(self, chat_id: int, days: int = 7) -> Dict:
         """获取违规统计"""

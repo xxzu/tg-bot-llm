@@ -1,8 +1,10 @@
 """OpenAI Chat Completions 兼容适配（NVIDIA / OpenRouter）。"""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import aiohttp
@@ -70,17 +72,54 @@ async def _iter_sse_content(response: aiohttp.ClientResponse) -> AsyncIterator[s
                 yield final_content
 
 
+def _is_openrouter(provider: ProviderSpec) -> bool:
+    return provider.name == "openrouter" or "openrouter.ai" in (provider.base_url or "")
+
+
 async def _post_json(
     api_url: str,
     headers: Dict[str, str],
     payload: Dict[str, Any],
+    *,
+    provider: Optional[ProviderSpec] = None,
+    model_id: str = "",
 ) -> Dict[str, Any]:
+    from config.performance import OPENROUTER_API_RETRIES
+
+    retries = OPENROUTER_API_RETRIES if provider and _is_openrouter(provider) else 0
     session = await get_http_session()
-    async with session.post(api_url, headers=headers, json=payload) as response:
-        body = await response.text()
-        if response.status != 200:
-            raise RuntimeError(f"API {response.status}: {body[:500]}")
-        return json.loads(body)
+    t0 = time.monotonic()
+    last_body = ""
+    for attempt in range(retries + 1):
+        async with session.post(api_url, headers=headers, json=payload) as response:
+            last_body = await response.text()
+            if response.status == 200:
+                if provider and _is_openrouter(provider):
+                    logger.info(
+                        "OpenRouter 完成 model=%s 耗时=%.2fs stream=%s",
+                        model_id or payload.get("model"),
+                        time.monotonic() - t0,
+                        payload.get("stream"),
+                    )
+                return json.loads(last_body)
+            if (
+                response.status == 429
+                and provider
+                and _is_openrouter(provider)
+                and attempt < retries
+            ):
+                wait = 2.0 * (attempt + 1)
+                logger.warning(
+                    "OpenRouter 429 限流 model=%s，%ss 后重试 (%s/%s)",
+                    model_id or payload.get("model"),
+                    wait,
+                    attempt + 1,
+                    retries,
+                )
+                await asyncio.sleep(wait)
+                continue
+            raise RuntimeError(f"API {response.status}: {last_body[:500]}")
+    raise RuntimeError(f"API failed: {last_body[:500]}")
 
 
 async def complete(
@@ -91,7 +130,13 @@ async def complete(
 ) -> str:
     messages = build_chat_messages_from_request(request)
     payload = _build_payload(registry, spec, messages, stream=False)
-    result = await _post_json(provider.base_url, _auth_headers(provider), payload)
+    result = await _post_json(
+        provider.base_url,
+        _auth_headers(provider),
+        payload,
+        provider=provider,
+        model_id=spec.id,
+    )
     if "choices" in result and result["choices"]:
         return ensure_telegram_text(result["choices"][0]["message"].get("content"))
     raise RuntimeError("API 返回格式异常")
@@ -108,14 +153,55 @@ async def iter_complete(
     headers["Accept"] = "text/event-stream"
     payload = _build_payload(registry, spec, messages, stream=True)
 
+    from config.performance import OPENROUTER_API_RETRIES
+
     session = await get_http_session()
-    async with session.post(provider.base_url, headers=headers, json=payload) as response:
-        if response.status != 200:
-            error_text = await response.text()
-            logger.error("OpenAI-compat API %s: %s", response.status, error_text[:300])
-            raise RuntimeError(f"API 请求失败: {response.status}")
-        async for piece in _iter_sse_content(response):
-            yield piece
+    retries = OPENROUTER_API_RETRIES if _is_openrouter(provider) else 0
+    t0 = time.monotonic()
+    first_token_logged = False
+    for attempt in range(retries + 1):
+        async with session.post(
+            provider.base_url, headers=headers, json=payload
+        ) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                if (
+                    response.status == 429
+                    and _is_openrouter(provider)
+                    and attempt < retries
+                ):
+                    wait = 2.0 * (attempt + 1)
+                    logger.warning(
+                        "OpenRouter 流式 429 model=%s，%ss 后重试",
+                        spec.id,
+                        wait,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                logger.error(
+                    "OpenAI-compat API %s: %s", response.status, error_text[:300]
+                )
+                raise RuntimeError(f"API 请求失败: {response.status}")
+            async for piece in _iter_sse_content(response):
+                if (
+                    not first_token_logged
+                    and _is_openrouter(provider)
+                    and piece
+                ):
+                    logger.info(
+                        "OpenRouter 首 token model=%s TTFT=%.2fs",
+                        spec.id,
+                        time.monotonic() - t0,
+                    )
+                    first_token_logged = True
+                yield piece
+            if _is_openrouter(provider):
+                logger.info(
+                    "OpenRouter 流式结束 model=%s 总耗时=%.2fs",
+                    spec.id,
+                    time.monotonic() - t0,
+                )
+            return
 
 
 async def complete_with_tools(
@@ -141,7 +227,9 @@ async def complete_with_tools(
             "tool_choice": "auto",
             **extra,
         }
-        result = await _post_json(provider.base_url, headers, payload)
+        result = await _post_json(
+            provider.base_url, headers, payload, provider=provider, model_id=spec.id
+        )
         msg = (result.get("choices") or [{}])[0].get("message") or {}
         tool_calls = msg.get("tool_calls")
         if tool_calls:
@@ -202,7 +290,13 @@ async def vision(
     if infer.get("chat_template_kwargs"):
         payload["chat_template_kwargs"] = infer["chat_template_kwargs"]
 
-    result = await _post_json(provider.base_url, _auth_headers(provider), payload)
+    result = await _post_json(
+        provider.base_url,
+        _auth_headers(provider),
+        payload,
+        provider=provider,
+        model_id=spec.id,
+    )
     if "choices" in result and result["choices"]:
         return result["choices"][0]["message"]["content"]
     raise RuntimeError("API 返回格式异常")

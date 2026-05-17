@@ -104,8 +104,6 @@ class HandleTextMessageUseCase:
                     bot, message, use_tools=use_group_tools
                 )
             except Exception as e:
-                import logging
-
                 logging.exception("构建群聊上下文失败，将跳过群管附加说明: %s", e)
                 group_addon = ""
             if group_addon:
@@ -184,8 +182,21 @@ class HandleTextMessageUseCase:
             )
         except Exception as e:
             logging.exception(e)
+            err = str(e)
+            if model_spec.provider == "openrouter":
+                if "429" in err:
+                    err = (
+                        f"{err}\n\n"
+                        "提示：当前 OpenRouter 免费模型可能被上游限流，可换其它 🆓 模型，"
+                        "或在 .env 设置 OPENROUTER_PROVIDER_SORT=throughput。"
+                    )
+                elif "502" in err or "503" in err or "504" in err:
+                    err = (
+                        f"{err}\n\n"
+                        "提示：OpenRouter 上游节点暂时不可用，请换模型或稍后再试。"
+                    )
             return TextHandleResult(
-                error_message=str(e),
+                error_message=err,
                 delivery_mode=delivery_mode,
                 persist_user_id=user_id,
                 persist_chat_id=chat_id,

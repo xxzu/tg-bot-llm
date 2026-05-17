@@ -103,8 +103,19 @@ class LLMRegistry:
         elif spec.inference_profile:
             fields = dict(self.inference_profiles.get(spec.inference_profile, {}))
 
-        if spec.provider == "openrouter" and "max_tokens" not in fields:
-            fields["max_tokens"] = CHAT_MAX_OUTPUT_TOKENS
+        if spec.provider == "openrouter":
+            from config.performance import (
+                OPENROUTER_MAX_OUTPUT_TOKENS,
+                OPENROUTER_PROVIDER_SORT,
+            )
+
+            cap = OPENROUTER_MAX_OUTPUT_TOKENS
+            if "max_tokens" not in fields:
+                fields["max_tokens"] = cap
+            else:
+                fields["max_tokens"] = min(int(fields["max_tokens"]), cap)
+            if OPENROUTER_PROVIDER_SORT:
+                fields.setdefault("provider", {"sort": OPENROUTER_PROVIDER_SORT})
 
         if spec.provider == "nvidia":
             from services.llm.adapters.nvidia_inference import nvidia_inference_fields
@@ -160,6 +171,8 @@ def _build_registry(data: Dict[str, Any]) -> LLMRegistry:
 
     for raw in data.get("models") or []:
         caps = tuple(raw.get("capabilities") or ["chat"])
+        if raw.get("provider") == "openrouter" and "stream" not in caps:
+            caps = (*caps, "stream")
         spec = ModelSpec(
             id=raw["id"],
             key=raw.get("key", ""),
